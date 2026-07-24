@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import requests
 import streamlit as st
 import pandas as pd
 from pyvis.network import Network
@@ -24,6 +25,148 @@ def get_secret(key, default=""):
 
 
 GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
+OPENCVE_TOKEN = get_secret("OPENCVE_TOKEN")
+
+
+def fetch_cve_from_nvd(cve_id):
+    """查詢 NVD 官方 CVE 資料庫，取得比 Nessus CSV 更完整的描述、CVSS 向量、CWE 與參考連結。"""
+    resp = requests.get(
+        "https://services.nvd.nist.gov/rest/json/cves/2.0",
+        params={"cveId": cve_id},
+        timeout=8,
+    )
+    resp.raise_for_status()
+    vulns = resp.json().get("vulnerabilities", [])
+    if not vulns:
+        return None
+
+    cve = vulns[0]["cve"]
+    description = next((d["value"] for d in cve.get("descriptions", []) if d["lang"] == "en"), "")
+
+    cvss_vector, cvss_score, cvss_severity = "", None, ""
+    for key in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]:
+        metric = cve.get("metrics", {}).get(key)
+        if metric:
+            m = metric[0]
+            cvss_vector = m["cvssData"].get("vectorString", "")
+            cvss_score = m["cvssData"].get("baseScore")
+            cvss_severity = m.get("baseSeverity", m["cvssData"].get("baseSeverity", ""))
+            break
+
+    cwes = sorted({
+        d["value"]
+        for w in cve.get("weaknesses", [])
+        for d in w.get("description", [])
+        if d.get("lang") == "en"
+    })
+    references = [r["url"] for r in cve.get("references", [])][:5]
+
+    return {
+        "source": "NVD",
+        "description": description,
+        "cvss_vector": cvss_vector,
+        "cvss_score": cvss_score,
+        "cvss_severity": cvss_severity,
+        "cwes": cwes,
+        "references": references,
+    }
+
+
+def fetch_cve_from_opencve(cve_id):
+    """OpenCVE 備用來源，需要 Organization API Token（OPENCVE_TOKEN）才會啟用。"""
+    if not OPENCVE_TOKEN:
+        return None
+
+    resp = requests.get(
+        f"https://app.opencve.io/api/v2/cves/{cve_id}",
+        headers={"Authorization": f"Bearer {OPENCVE_TOKEN}"},
+        timeout=8,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    cvss = data.get("cvss") if isinstance(data.get("cvss"), dict) else {}
+    return {
+        "source": "OpenCVE",
+        "description": data.get("description", ""),
+        "cvss_vector": cvss.get("vector", ""),
+        "cvss_score": cvss.get("score"),
+        "cvss_severity": "",
+        "cwes": data.get("cwes", []),
+        "references": [r.get("url", r) if isinstance(r, dict) else r for r in data.get("references", [])][:5],
+    }
+
+
+def fetch_epss(cve_id):
+    """FIRST.org EPSS：這個 CVE 未來 30 天內被實際攻擊利用的機率，免驗證。"""
+    resp = requests.get(
+        "https://api.first.org/data/v1/epss",
+        params={"cve": cve_id},
+        timeout=8,
+    )
+    resp.raise_for_status()
+    rows = resp.json().get("data", [])
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "score": float(row["epss"]),
+        "percentile": float(row["percentile"]),
+    }
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_cisa_kev_catalog():
+    """CISA 已知遭利用漏洞目錄，全量下載，一天快取一次，避免每次點擊都抓 1.5MB。"""
+    resp = requests.get(
+        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+        timeout=15,
+    )
+    resp.raise_for_status()
+    entries = resp.json().get("vulnerabilities", [])
+    return {e["cveID"]: e for e in entries}
+
+
+def fetch_kev_status(cve_id):
+    try:
+        catalog = fetch_cisa_kev_catalog()
+    except Exception:
+        return None
+    entry = catalog.get(cve_id)
+    if not entry:
+        return {"listed": False}
+    return {
+        "listed": True,
+        "date_added": entry.get("dateAdded", ""),
+        "due_date": entry.get("dueDate", ""),
+        "ransomware_use": entry.get("knownRansomwareCampaignUse", "Unknown"),
+        "required_action": entry.get("requiredAction", ""),
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_cve_enrichment(cve_id):
+    """依序嘗試 NVD、OpenCVE 取得基本資料，並疊加 EPSS 機率分數與 CISA KEV 是否已遭利用。"""
+    enrichment = None
+    for fetcher in (fetch_cve_from_nvd, fetch_cve_from_opencve):
+        try:
+            result = fetcher(cve_id)
+            if result:
+                enrichment = result
+                break
+        except Exception:
+            continue
+
+    if enrichment is None:
+        return None
+
+    try:
+        enrichment["epss"] = fetch_epss(cve_id)
+    except Exception:
+        enrichment["epss"] = None
+
+    enrichment["kev"] = fetch_kev_status(cve_id)
+
+    return enrichment
 
 RISK_COLORS = {
     "Critical": "#FF4B4B",
@@ -38,31 +181,68 @@ AI_SUMMARY_SCHEMA = {
         "what": {"type": "string"},
         "harm": {"type": "string"},
         "action": {"type": "string"},
+        "reference": {"type": "string"},
     },
-    "required": ["what", "harm", "action"],
+    "required": ["what", "harm", "action", "reference"],
 }
 
 
-def generate_ai_summary(cve, cve_info, endpoints_text):
+def generate_ai_summary(cve, cve_info, endpoints_text, enrichment=None):
     """回傳固定結構 {what, harm, action}，畫面排版由 App 自己控制，
-    不依賴模型每次輸出的文字格式，避免每次呼叫排版不一致。"""
+    不依賴模型每次輸出的文字格式，避免每次呼叫排版不一致。
+    enrichment 是從 NVD/OpenCVE 查到的官方資料，能補足 Nessus CSV 描述過於精簡的問題。"""
     client = genai.Client(api_key=GOOGLE_API_KEY)
+
+    enrichment_text = "（未取得官方 CVE 資料庫額外資訊，僅根據 Nessus 掃描結果分析）"
+    if enrichment:
+        epss = enrichment.get("epss")
+        epss_text = (
+            f"{epss['score']*100:.1f}%（贏過 {epss['percentile']*100:.0f}% 的 CVE，代表未來 30 天內被實際攻擊利用的機率）"
+            if epss else "無資料"
+        )
+        kev = enrichment.get("kev")
+        if kev and kev.get("listed"):
+            kev_text = (
+                f"是！已列入 CISA 已知遭利用漏洞目錄（加入日期 {kev.get('date_added', '無')}，"
+                f"要求修補期限 {kev.get('due_date', '無')}，勒索軟體使用情況：{kev.get('ransomware_use', '無')}）"
+            )
+        elif kev is not None:
+            kev_text = "否，目前不在 CISA 已知遭利用漏洞目錄中"
+        else:
+            kev_text = "無資料"
+
+        enrichment_text = f"""資料來源：{enrichment['source']}
+官方完整描述：{enrichment['description'] or '無'}
+CVSS 向量：{enrichment['cvss_vector'] or '無'}（分數：{enrichment['cvss_score']}，等級：{enrichment['cvss_severity'] or '無'}）
+關聯 CWE：{', '.join(enrichment['cwes']) if enrichment['cwes'] else '無'}
+EPSS 被實際利用機率：{epss_text}
+CISA KEV 是否已知遭利用：{kev_text}
+參考連結：{', '.join(enrichment['references']) if enrichment['references'] else '無'}"""
+
     prompt = f"""你是資安分析師，請針對以下弱點掃描結果，寫給非技術主管看的說明。
-不要只是把漏洞描述翻譯成中文，而是要用你自己的理解重新解釋。請填寫三個欄位：
+不要只是把漏洞描述翻譯成中文，而是要用你自己的理解重新解釋，並必須實際引用下方「官方 CVE 資料庫補充資訊」的具體數據
+（例如 CVSS 分數、EPSS 機率、是否列入 CISA KEV），不能只是背景參考卻完全不提到。請填寫四個欄位：
 
 - what：用非技術人員能懂的比喻或白話，解釋這個弱點的成因（例如是什麼設定錯誤、過時軟體、還是驗證漏洞）。1-2 句話。
 - harm：如果被入侵者利用，實際上可能發生什麼後果（例如：資料外洩、被植入勒索軟體、被當跳板攻擊其他系統、服務中斷等），
   要具體到這個弱點的攻擊情境，不要講空泛的「資安風險」。1-2 句話。
-- action：根據風險等級與修補方案，給出優先順序建議。1 句話。
+- action：根據風險等級、CVSS 分數、EPSS 機率、是否已被 CISA 列為已知遭利用，給出優先順序建議
+  （如果已列入 CISA KEV，要明確指出這代表已經有真實攻擊案例，應優先於其他同等級但沒被列入的漏洞）。1 句話。
+- reference：明確引用官方 CVE 資料庫的具體數據來佐證，例如「根據 NVD，此漏洞 CVSS 分數為 9.1（Critical），EPSS 機率 99.9%，
+  且已列入 CISA KEV」。如果下方沒有取得官方資料（顯示「未取得官方 CVE 資料庫額外資訊」），就直接寫
+  「本次分析僅根據 Nessus 掃描結果，未查得官方 CVE 資料庫資訊」。1 句話。
 
 CVE: {cve}
 名稱: {cve_info['Name']}
 風險等級: {cve_info['Risk']}
 CWE: {cve_info['CWE_Parsed']}
-漏洞描述: {cve_info['Description']}
+Nessus 漏洞描述: {cve_info['Description']}
 官方修補方案: {cve_info['Solution'] if pd.notna(cve_info['Solution']) else '無'}
 受影響主機/Port:
 {endpoints_text}
+
+官方 CVE 資料庫補充資訊：
+{enrichment_text}
 """
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
@@ -255,26 +435,73 @@ if uploaded_file is not None:
 
                             st.divider()
                             summary_key = f"ai_summary_{cve}"
-                            if st.button("🤖 產生 AI 白話摘要", key=f"ai_btn_{cve}"):
+                            enrichment_key = f"cve_enrichment_{cve}"
+                            if st.button("🤖 AI 摘要與官方資源", key=f"ai_btn_{cve}"):
                                 if not GOOGLE_API_KEY:
                                     st.error("尚未設定 GOOGLE_API_KEY，請至 .env 補上金鑰後重新啟動 App。")
                                 else:
-                                    with st.spinner("AI 分析中..."):
+                                    with st.spinner("查詢官方 CVE 資料庫並產生 AI 分析..."):
                                         try:
+                                            enrichment = fetch_cve_enrichment(cve)
+                                            st.session_state[enrichment_key] = enrichment
                                             endpoints = group[['Host', 'Port', 'Protocol']].drop_duplicates()
                                             endpoints_text = "\n".join(
                                                 f"- {r.Host}:{r.Port} ({r.Protocol})" for r in endpoints.itertuples()
                                             )
-                                            st.session_state[summary_key] = generate_ai_summary(cve, cve_info, endpoints_text)
+                                            st.session_state[summary_key] = generate_ai_summary(
+                                                cve, cve_info, endpoints_text, enrichment
+                                            )
                                         except Exception as e:
                                             st.error(f"AI 摘要產生失敗：{e}")
 
                             if summary_key in st.session_state:
                                 summary = st.session_state[summary_key]
-                                st.markdown("**🤖 AI 白話摘要**")
-                                st.markdown(f"**這是什麼？**\n\n{summary['what']}")
-                                st.markdown(f"**可能造成的危害**\n\n{summary['harm']}")
-                                st.markdown(f"**建議處理方式**\n\n{summary['action']}")
+                                st.markdown("#### 🤖 AI 白話摘要")
+
+                                with st.container(border=True):
+                                    st.markdown("🔍 **這是什麼？**")
+                                    st.write(summary['what'])
+
+                                st.warning(f"⚠️ **可能造成的危害**\n\n{summary['harm']}")
+                                st.success(f"✅ **建議處理方式**\n\n{summary['action']}")
+
+                                with st.container(border=True):
+                                    st.markdown("📎 **官方資料佐證**")
+                                    st.caption(summary['reference'])
+
+                                enrichment = st.session_state.get(enrichment_key)
+                                if enrichment:
+                                    with st.expander(f"🌐 官方 CVE 資料來源（{enrichment['source']}）"):
+                                        st.markdown(f"**官方描述**：{enrichment['description'] or '無'}")
+                                        st.markdown(
+                                            f"**CVSS**：`{enrichment['cvss_vector'] or '無'}`"
+                                            f"（分數 {enrichment['cvss_score']}，{enrichment['cvss_severity'] or '無'}）"
+                                        )
+                                        if enrichment['cwes']:
+                                            st.markdown(f"**關聯 CWE**：{', '.join(enrichment['cwes'])}")
+
+                                        epss = enrichment.get('epss')
+                                        if epss:
+                                            st.markdown(
+                                                f"**EPSS 被利用機率**：{epss['score']*100:.1f}%"
+                                                f"（贏過 {epss['percentile']*100:.0f}% 的 CVE）"
+                                            )
+
+                                        kev = enrichment.get('kev')
+                                        if kev and kev.get('listed'):
+                                            st.error(
+                                                f"⚠️ 已列入 CISA 已知遭利用漏洞目錄（KEV）\n\n"
+                                                f"加入日期：{kev.get('date_added', '無')}　"
+                                                f"要求修補期限：{kev.get('due_date', '無')}　"
+                                                f"勒索軟體使用情況：{kev.get('ransomware_use', '無')}"
+                                            )
+                                        elif kev is not None:
+                                            st.caption("目前不在 CISA KEV（已知遭利用漏洞）目錄中")
+
+                                        for ref in enrichment['references']:
+                                            st.markdown(f"- {ref}")
+                                else:
+                                    st.caption("⚠️ 未取得官方 CVE 資料庫資訊，以上摘要僅根據 Nessus 掃描結果分析。")
 
                         with t2:
                             st.success(cve_info['Solution'] if pd.notna(cve_info['Solution']) else "無明確修補方案，請參考官方規範。")
