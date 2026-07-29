@@ -27,6 +27,227 @@ def get_secret(key, default=""):
 GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
 OPENCVE_TOKEN = get_secret("OPENCVE_TOKEN")
 
+KG_PATH = os.path.join(os.path.dirname(__file__), "data", "cwe_knowledge_graph.json")
+
+
+@st.cache_data(show_spinner=False)
+def load_cwe_knowledge_graph():
+    """CWE/CAPEC/ATT&CK 知識圖譜，離線從 MITRE 官方資料建置、隨程式碼一起部署，
+    不依賴任何即時資料庫連線（本機、Streamlit Cloud 都能直接讀）。"""
+    try:
+        with open(KG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"cwe": {}, "capec": {}}
+
+
+def normalize_cwe_id(raw_cwe):
+    """Nessus CSV 的 XREF 常寫成 'CWE:79'，NVD/知識圖譜統一用 'CWE-79'，這裡做格式對齊。"""
+    if not raw_cwe or raw_cwe == "N/A":
+        return None
+    m = re.search(r"\d+", raw_cwe)
+    return f"CWE-{m.group()}" if m else None
+
+
+def get_related_weakness_context_offline(cwe_id):
+    """依 CWE 編號從本機知識圖譜找出：CWE 說明、相關弱點（父子/同儕分類）、
+    對應的 CAPEC 攻擊手法與 ATT&CK 技術。找不到就回傳 None。"""
+    kg = load_cwe_knowledge_graph()
+    cwe_entry = kg["cwe"].get(cwe_id)
+    if not cwe_entry:
+        return None
+
+    related_weaknesses = [
+        {
+            "cwe_id": rw["cwe_id"],
+            "nature": rw["nature"],
+            "name": kg["cwe"].get(rw["cwe_id"], {}).get("name", ""),
+        }
+        for rw in cwe_entry["related_weaknesses"]
+    ]
+
+    attack_patterns = []
+    all_techniques = {}
+    for capec_id in cwe_entry["related_capec"]:
+        capec_entry = kg["capec"].get(capec_id)
+        if capec_entry:
+            attack_patterns.append({
+                "capec_id": capec_id,
+                "name": capec_entry["name"],
+                "severity": capec_entry["severity"],
+                "attack_techniques": capec_entry["attack_techniques"],
+            })
+            for t in capec_entry["attack_techniques"]:
+                if t.get("id"):
+                    all_techniques[t["id"]] = t["name"]
+
+    return {
+        "source": "本機 MITRE 知識圖譜",
+        "cwe_id": cwe_id,
+        "name": cwe_entry["name"],
+        "description": cwe_entry["description"],
+        "related_weaknesses": related_weaknesses,
+        "attack_patterns": attack_patterns,
+        "attack_techniques": [{"id": k, "name": v} for k, v in all_techniques.items()],
+    }
+
+
+TUNNEL_LOCAL_PORT = 17687
+
+
+def get_cloudflared_binary():
+    """找到可用的 cloudflared 執行檔：本機開發環境通常已透過 brew 裝好、在 PATH 裡；
+    Streamlit Community Cloud 這種雲端容器沒有，改成第一次啟動時下載官方單一執行檔，
+    存到暫存目錄重複使用，不需要 apt/套件管理員權限。"""
+    import shutil
+
+    which_path = shutil.which("cloudflared")
+    if which_path:
+        return which_path
+
+    bin_dir = "/tmp/cloudflared_bin"
+    bin_path = os.path.join(bin_dir, "cloudflared")
+    if os.path.exists(bin_path):
+        return bin_path
+
+    os.makedirs(bin_dir, exist_ok=True)
+    url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    with open(bin_path, "wb") as f:
+        f.write(resp.content)
+    os.chmod(bin_path, 0o755)
+    return bin_path
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_cloudflare_tunnel():
+    """在背景啟動 cloudflared access tcp，把共用 Neo4j 的 Bolt 協定用 WebSocket 包裝
+    後轉發到本機 port，藉此繞過 Cloudflare 代理對原生 Bolt 協定的封鎖。
+    用 cache_resource 讓這個 subprocess 整個 App 生命週期只啟動一次。
+    成功回傳本機轉發後的 bolt URI；任何一步失敗都回傳 None，由呼叫端 fallback。"""
+    import subprocess
+    import socket
+    import time
+
+    uri = get_secret("NEO4J_URI")
+    if not uri:
+        return None
+
+    hostname = re.sub(r"^[a-z+]+://", "", uri).split(":")[0].split("/")[0]
+    if not hostname:
+        return None
+
+    try:
+        binary = get_cloudflared_binary()
+    except Exception:
+        return None
+
+    try:
+        subprocess.Popen(
+            [binary, "access", "tcp",
+             "--hostname", hostname,
+             "--url", f"127.0.0.1:{TUNNEL_LOCAL_PORT}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+
+    # 等通道建立起來，最多等 10 秒；一旦本機 port 開始接受連線就視為就緒
+    for _ in range(20):
+        try:
+            with socket.create_connection(("127.0.0.1", TUNNEL_LOCAL_PORT), timeout=0.5):
+                return f"bolt://127.0.0.1:{TUNNEL_LOCAL_PORT}"
+        except OSError:
+            time.sleep(0.5)
+
+    return None
+
+
+def get_neo4j_driver():
+    """建立共用 Neo4j 的連線（蘇柏翰維護的協作資料庫）。連不上就回傳 None，
+    讓呼叫端自動退回本機知識圖譜，不會讓整個 App 卡住或報錯。
+    用 cache_resource 讓整個 session 只嘗試連線一次，避免每張卡片都重新等逾時。
+    優先透過 cloudflared 通道連線（繞過協定封鎖），通道建立失敗才退而求其次
+    直接嘗試原始 URI（已知在多數環境會被 Cloudflare 擋下，留著只是保底）。"""
+    user = get_secret("NEO4J_USER", "neo4j")
+    pwd = get_secret("NEO4J_PASSWORD")
+    if not pwd:
+        return None
+
+    tunnel_uri = ensure_cloudflare_tunnel()
+    candidate_uris = [tunnel_uri] if tunnel_uri else []
+    candidate_uris.append(get_secret("NEO4J_URI"))
+
+    for uri in candidate_uris:
+        if not uri:
+            continue
+        try:
+            driver = GraphDatabase.driver(uri, auth=(user, pwd), connection_timeout=5)
+            driver.verify_connectivity()
+            return driver
+        except Exception:
+            continue
+
+    return None
+
+
+def get_related_weakness_context_online(cwe_id):
+    """查詢蘇柏翰維護的共用 Neo4j，取得跟本機知識圖譜相同結構的資料。
+    Neo4j 連不上、查無資料、或查詢過程出錯，都回傳 None（由呼叫端 fallback）。"""
+    driver = get_neo4j_driver()
+    if driver is None:
+        return None
+
+    query = """
+    MATCH (c:CWE {Name: $cwe_id})
+    OPTIONAL MATCH (c)-[rel:Related_Weakness]-(rw:CWE)
+    OPTIONAL MATCH (c)-[:RelatedAttackPattern]->(cap:CAPEC)
+    OPTIONAL MATCH (cap)-[:Mapped_Attack]->(atk:ATTACK)
+    RETURN c.Description AS description,
+           collect(DISTINCT {cwe_id: rw.Name, name: rw.Name, nature: rel.Nature}) AS related_weaknesses,
+           collect(DISTINCT {capec_id: cap.Name, name: cap.Name}) AS attack_patterns,
+           collect(DISTINCT atk.Name) AS attack_techniques
+    LIMIT 1
+    """
+    try:
+        with driver.session() as session:
+            result = session.run(query, cwe_id=cwe_id)
+            record = result.single()
+            if record is None or record["description"] is None:
+                return None
+
+            related_weaknesses = [
+                rw for rw in record["related_weaknesses"] if rw.get("cwe_id")
+            ]
+            attack_patterns = [
+                {**ap, "severity": None, "attack_techniques": []}
+                for ap in record["attack_patterns"] if ap.get("capec_id")
+            ]
+            # Neo4j 查詢沒辦法細分「哪個 CAPEC 對應哪個 ATT&CK 技術」，
+            # 只能拿到整個 CWE 底下的技術總表，所以另外放在 attack_techniques 彙總欄位
+            attack_techniques = [
+                {"id": None, "name": name} for name in record["attack_techniques"] if name
+            ]
+
+            return {
+                "source": "Neo4j（蘇柏翰協作資料庫）",
+                "cwe_id": cwe_id,
+                "name": cwe_id,
+                "description": record["description"] or "",
+                "related_weaknesses": related_weaknesses,
+                "attack_patterns": attack_patterns,
+                "attack_techniques": attack_techniques,
+            }
+    except Exception:
+        return None
+
+
+def get_related_weakness_context(cwe_id):
+    """優先查詢共用 Neo4j（跟同事協作用的最新資料），查不到才退回本機的 MITRE 靜態知識圖譜。"""
+    return get_related_weakness_context_online(cwe_id) or get_related_weakness_context_offline(cwe_id)
+
 
 def fetch_cve_from_nvd(cve_id):
     """查詢 NVD 官方 CVE 資料庫，取得比 Nessus CSV 更完整的描述、CVSS 向量、CWE 與參考連結。"""
@@ -182,15 +403,17 @@ AI_SUMMARY_SCHEMA = {
         "harm": {"type": "string"},
         "action": {"type": "string"},
         "reference": {"type": "string"},
+        "related": {"type": "string"},
     },
-    "required": ["what", "harm", "action", "reference"],
+    "required": ["what", "harm", "action", "reference", "related"],
 }
 
 
-def generate_ai_summary(cve, cve_info, endpoints_text, enrichment=None):
-    """回傳固定結構 {what, harm, action}，畫面排版由 App 自己控制，
+def generate_ai_summary(cve, cve_info, endpoints_text, enrichment=None, weakness_context=None, related_cves=None):
+    """回傳固定結構 {what, harm, action, reference, related}，畫面排版由 App 自己控制，
     不依賴模型每次輸出的文字格式，避免每次呼叫排版不一致。
-    enrichment 是從 NVD/OpenCVE 查到的官方資料，能補足 Nessus CSV 描述過於精簡的問題。"""
+    enrichment 是從 NVD/OpenCVE 查到的官方資料；weakness_context 是 CWE/CAPEC/ATT&CK 知識圖譜資料；
+    related_cves 是這次掃描裡其他共用同一個 CWE 的漏洞，三者都能補足 Nessus CSV 描述過於精簡的問題。"""
     client = genai.Client(api_key=GOOGLE_API_KEY)
 
     enrichment_text = "（未取得官方 CVE 資料庫額外資訊，僅根據 Nessus 掃描結果分析）"
@@ -219,9 +442,32 @@ EPSS 被實際利用機率：{epss_text}
 CISA KEV 是否已知遭利用：{kev_text}
 參考連結：{', '.join(enrichment['references']) if enrichment['references'] else '無'}"""
 
+    weakness_text = "（未取得 CWE 知識圖譜資料）"
+    if weakness_context:
+        rw_text = "、".join(
+            f"{rw['name']}（{rw['cwe_id']}，關係：{rw['nature']}）" for rw in weakness_context["related_weaknesses"][:5]
+        ) or "無"
+        capec_lines = []
+        for ap in weakness_context["attack_patterns"][:5]:
+            techniques = "、".join(f"{t['name']}（{t['id']}）" for t in ap["attack_techniques"]) or "無對應 ATT&CK 技術"
+            capec_lines.append(f"{ap['name']}（{ap['capec_id']}，嚴重程度：{ap['severity'] or '未評級'}）→ {techniques}")
+        overall_techniques = "、".join(
+            t["name"] for t in weakness_context.get("attack_techniques", [])[:8]
+        ) or "無"
+        weakness_text = f"""CWE 分類：{weakness_context['cwe_id']} {weakness_context['name']}
+CWE 官方說明：{weakness_context['description'][:300]}
+相關/父子弱點分類：{rw_text}
+對應的 CAPEC 攻擊手法與 ATT&CK 技術：
+{chr(10).join(capec_lines) if capec_lines else '無'}
+彙總 ATT&CK 技術：{overall_techniques}"""
+
+    related_text = "（這次掃描中沒有其他漏洞共用同一個 CWE 分類）"
+    if related_cves:
+        related_text = "、".join(related_cves)
+
     prompt = f"""你是資安分析師，請針對以下弱點掃描結果，寫給非技術主管看的說明。
 不要只是把漏洞描述翻譯成中文，而是要用你自己的理解重新解釋，並必須實際引用下方「官方 CVE 資料庫補充資訊」的具體數據
-（例如 CVSS 分數、EPSS 機率、是否列入 CISA KEV），不能只是背景參考卻完全不提到。請填寫四個欄位：
+（例如 CVSS 分數、EPSS 機率、是否列入 CISA KEV），不能只是背景參考卻完全不提到。請填寫五個欄位：
 
 - what：用非技術人員能懂的比喻或白話，解釋這個弱點的成因（例如是什麼設定錯誤、過時軟體、還是驗證漏洞）。1-2 句話。
 - harm：如果被入侵者利用，實際上可能發生什麼後果（例如：資料外洩、被植入勒索軟體、被當跳板攻擊其他系統、服務中斷等），
@@ -231,6 +477,9 @@ CISA KEV 是否已知遭利用：{kev_text}
 - reference：明確引用官方 CVE 資料庫的具體數據來佐證，例如「根據 NVD，此漏洞 CVSS 分數為 9.1（Critical），EPSS 機率 99.9%，
   且已列入 CISA KEV」。如果下方沒有取得官方資料（顯示「未取得官方 CVE 資料庫額外資訊」），就直接寫
   「本次分析僅根據 Nessus 掃描結果，未查得官方 CVE 資料庫資訊」。1 句話。
+- related：說明這個弱點分類常見的攻擊手法（引用下方 CAPEC/ATT&CK 資料），以及如果這次掃描裡還有其他漏洞屬於同一個
+  CWE 分類，要指出這代表環境中存在系統性、重複出現的弱點模式，不是單一個案，修補時應該一併檢討根本原因
+  （例如是不是共用同一套過時框架、同一種開發習慣）。如果都沒有相關資料，就寫「未查得相關攻擊手法或同類漏洞資料」。1-2 句話。
 
 CVE: {cve}
 名稱: {cve_info['Name']}
@@ -243,6 +492,12 @@ Nessus 漏洞描述: {cve_info['Description']}
 
 官方 CVE 資料庫補充資訊：
 {enrichment_text}
+
+CWE/CAPEC/ATT&CK 知識圖譜補充資訊：
+{weakness_text}
+
+這次掃描中同樣屬於 {cve_info['CWE_Parsed']} 分類的其他漏洞：
+{related_text}
 """
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
@@ -322,6 +577,15 @@ with st.sidebar:
         st.success("已自動套用固定連線設定")
     else:
         st.warning("未偵測到連線設定（.env 或 Secrets）")
+
+    if st.button("🔄 重新測試 Neo4j 連線", key="retry_neo4j"):
+        get_neo4j_driver.clear()
+
+    driver_status = get_neo4j_driver()
+    if driver_status is not None:
+        st.success("✅ 共用 Neo4j 連線正常，相關漏洞會優先用這份協作資料")
+    else:
+        st.caption("⚠️ 共用 Neo4j 連不上，相關漏洞功能會自動退回本機 MITRE 知識圖譜")
 
 if uploaded_file is not None:
     # 讀取 CSV
@@ -425,6 +689,12 @@ if uploaded_file is not None:
 
                 for cve, group in risk_group_df.groupby('CVE'):
                     cve_info = group.iloc[0]
+                    normalized_cwe = normalize_cwe_id(cve_info['CWE_Parsed'])
+                    weakness_context = get_related_weakness_context(normalized_cwe) if normalized_cwe else None
+                    related_cves = sorted(
+                        set(cve_df[cve_df['CWE_Parsed'] == cve_info['CWE_Parsed']]['CVE']) - {cve}
+                    ) if cve_info['CWE_Parsed'] != "N/A" else []
+
                     with st.expander(f"{cve} — {cve_info['Name']}"):
                         t1, t2, t3 = st.tabs(["📌 問題概述", "🛠️ 官方修補方案 (Solution)", "🔗 關聯 CWE/CVE 與參考來源"])
 
@@ -432,6 +702,42 @@ if uploaded_file is not None:
                             st.markdown(f"**漏洞名稱**：{cve_info['Name']}")
                             st.markdown(f"**風險等級**：`{cve_info['Risk']}`")
                             st.info(cve_info['Description'])
+
+                            with st.container(border=True):
+                                st.markdown("🔗 **相關漏洞**")
+                                if related_cves:
+                                    st.markdown(
+                                        f"這次掃描中還有 **{len(related_cves)}** 個漏洞跟這個同屬 "
+                                        f"`{cve_info['CWE_Parsed']}` 分類：{', '.join(related_cves)}"
+                                    )
+                                else:
+                                    st.caption("這次掃描中沒有其他漏洞屬於同一個 CWE 分類。")
+
+                                if weakness_context:
+                                    st.markdown(f"**弱點分類**：{weakness_context['cwe_id']} — {weakness_context['name']}")
+                                    if weakness_context['related_weaknesses']:
+                                        rw_labels = ", ".join(
+                                            f"{rw['name']}（{rw['cwe_id']}，{rw['nature']}）"
+                                            for rw in weakness_context['related_weaknesses'][:5]
+                                        )
+                                        st.caption(f"相關/父子弱點分類：{rw_labels}")
+                                    if weakness_context['attack_patterns']:
+                                        for ap in weakness_context['attack_patterns'][:5]:
+                                            techniques = ", ".join(
+                                                f"{t['name']}（{t['id']}）" for t in ap['attack_techniques']
+                                            )
+                                            st.caption(
+                                                f"⚔️ {ap['name']}（{ap['capec_id']}，嚴重程度 {ap['severity'] or '未評級'}）"
+                                                + (f" → ATT&CK: {techniques}" if techniques else "")
+                                            )
+                                    if weakness_context.get('attack_techniques'):
+                                        overall = ", ".join(
+                                            f"{t['name']}" + (f"（{t['id']}）" if t['id'] else "")
+                                            for t in weakness_context['attack_techniques'][:8]
+                                        )
+                                        st.caption(f"⚔️ 對應 ATT&CK 技術（彙總）：{overall}")
+                                else:
+                                    st.caption("目前查無此弱點分類的延伸資訊。")
 
                             st.divider()
                             summary_key = f"ai_summary_{cve}"
@@ -449,7 +755,8 @@ if uploaded_file is not None:
                                                 f"- {r.Host}:{r.Port} ({r.Protocol})" for r in endpoints.itertuples()
                                             )
                                             st.session_state[summary_key] = generate_ai_summary(
-                                                cve, cve_info, endpoints_text, enrichment
+                                                cve, cve_info, endpoints_text, enrichment,
+                                                weakness_context, related_cves
                                             )
                                         except Exception as e:
                                             st.error(f"AI 摘要產生失敗：{e}")
@@ -468,6 +775,10 @@ if uploaded_file is not None:
                                 with st.container(border=True):
                                     st.markdown("📎 **官方資料佐證**")
                                     st.caption(summary['reference'])
+
+                                with st.container(border=True):
+                                    st.markdown("🔗 **相關弱點與攻擊手法**")
+                                    st.caption(summary['related'])
 
                                 enrichment = st.session_state.get(enrichment_key)
                                 if enrichment:
