@@ -561,6 +561,74 @@ def build_risk_graph(risk_group_df, risk):
     """)
     return net
 
+
+def build_cve_relation_graph(cve, enrichment, weakness_context):
+    """針對單一 CVE，畫出「CVE → CWE → 相關弱點/CAPEC 攻擊手法 → ATT&CK 技術」的拓樸圖，
+    資料完全來自官方來源（NVD 的 enrichment ＋ CWE/CAPEC/ATT&CK 知識圖譜），
+    不是隨機示意，是這筆 CVE 實際查到的官方關聯。"""
+    net = Network(height="420px", width="100%", bgcolor="#222222", font_color="white")
+    net.add_node(cve, label=cve, color="#FF4B4B", size=30, title="核心 CVE")
+
+    cwe_ids = list(enrichment.get("cwes") or [])
+    if weakness_context and weakness_context["cwe_id"] not in cwe_ids:
+        cwe_ids.append(weakness_context["cwe_id"])
+
+    for cwe_id in cwe_ids:
+        cwe_label = weakness_context["name"] if (weakness_context and weakness_context["cwe_id"] == cwe_id) else cwe_id
+        net.add_node(cwe_id, label=cwe_id, title=cwe_label, color="#4B9CD3", size=22)
+        net.add_edge(cve, cwe_id, label="Problem_Type")
+
+    if weakness_context:
+        primary_cwe = weakness_context["cwe_id"]
+
+        for rw in weakness_context["related_weaknesses"][:6]:
+            net.add_node(rw["cwe_id"], label=rw["cwe_id"], title=rw["name"], color="#7FB3E8", size=16)
+            net.add_edge(primary_cwe, rw["cwe_id"], label=rw["nature"])
+
+        for ap in weakness_context["attack_patterns"][:6]:
+            net.add_node(ap["capec_id"], label=ap["capec_id"], title=ap["name"], color="#FFA500", size=18)
+            net.add_edge(primary_cwe, ap["capec_id"], label="RelatedAttackPattern")
+            for t in ap["attack_techniques"][:3]:
+                net.add_node(t["id"] or t["name"], label=t["id"] or t["name"], title=t["name"], color="#B266FF", size=14)
+                net.add_edge(ap["capec_id"], t["id"] or t["name"], label="Mapped_Attack")
+
+        # 線上查詢查不到「哪個 CAPEC 對應哪個 ATT&CK」，只有彙總技術清單時，
+        # 直接掛在主要 CWE 底下，至少讓攻擊手法的脈絡看得到
+        if weakness_context.get("attack_techniques") and not any(
+            ap["attack_techniques"] for ap in weakness_context["attack_patterns"]
+        ):
+            for t in weakness_context["attack_techniques"][:6]:
+                node_id = t["id"] or t["name"]
+                net.add_node(node_id, label=node_id, title=t["name"], color="#B266FF", size=14)
+                net.add_edge(primary_cwe, node_id, label="Mapped_Attack")
+
+    net.set_options("""
+    {
+      "nodes": { "font": { "size": 14, "color": "#ffffff" } },
+      "edges": {
+        "font": {
+          "size": 11,
+          "color": "#ffffff",
+          "align": "top",
+          "strokeWidth": 4,
+          "strokeColor": "#222222"
+        },
+        "smooth": { "type": "continuous" }
+      },
+      "physics": {
+        "barnesHut": {
+          "gravitationalConstant": -10000,
+          "centralGravity": 0.2,
+          "springLength": 180,
+          "springConstant": 0.03,
+          "damping": 0.15
+        },
+        "stabilization": { "iterations": 200 }
+      }
+    }
+    """)
+    return net
+
 # --- 頁面標題與佈局配置 ---
 st.set_page_config(page_title="資安漏洞互動式圖譜系統", layout="wide")
 st.title("🛡️ 弱點掃描 (Nessus) 互動分析與修補指引系統")
@@ -812,6 +880,14 @@ if uploaded_file is not None:
 
                                         for ref in enrichment['references']:
                                             st.markdown(f"- {ref}")
+
+                                        if enrichment.get('cwes') or weakness_context:
+                                            st.markdown("**🕸️ 官方關聯拓樸圖**（CVE → CWE → 相關弱點／攻擊手法）")
+                                            relation_net = build_cve_relation_graph(cve, enrichment, weakness_context)
+                                            relation_file = f"temp_graph_cve_{re.sub(r'[^A-Za-z0-9]', '_', cve)}.html"
+                                            relation_net.save_graph(relation_file)
+                                            with open(relation_file, 'r', encoding='utf-8') as f:
+                                                components.html(f.read(), height=440)
                                 else:
                                     st.caption("⚠️ 未取得官方 CVE 資料庫資訊，以上摘要僅根據 Nessus 掃描結果分析。")
 

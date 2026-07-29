@@ -2,6 +2,7 @@
 .streamlit/secrets.toml
 __pycache__/
 temp_graph.html
+temp_graph_cve_*.html
 lib/
 logs/
 .claude/
