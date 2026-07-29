@@ -206,8 +206,9 @@ def get_related_weakness_context_online(cwe_id):
     OPTIONAL MATCH (c)-[:RelatedAttackPattern]->(cap:CAPEC)
     OPTIONAL MATCH (cap)-[:Mapped_Attack]->(atk:ATTACK)
     RETURN c.Description AS description,
-           collect(DISTINCT {cwe_id: rw.Name, name: rw.Name, nature: rel.Nature}) AS related_weaknesses,
-           collect(DISTINCT {capec_id: cap.Name, name: cap.Name}) AS attack_patterns,
+           c.Extended_Name AS cwe_name,
+           collect(DISTINCT {cwe_id: rw.Name, name: rw.Extended_Name, nature: rel.Nature}) AS related_weaknesses,
+           collect(DISTINCT {capec_id: cap.Name, name: cap.ExtendedName, severity: cap.Typical_Severity}) AS attack_patterns,
            collect(DISTINCT atk.Name) AS attack_techniques
     LIMIT 1
     """
@@ -222,7 +223,7 @@ def get_related_weakness_context_online(cwe_id):
                 rw for rw in record["related_weaknesses"] if rw.get("cwe_id")
             ]
             attack_patterns = [
-                {**ap, "severity": None, "attack_techniques": []}
+                {**ap, "attack_techniques": []}
                 for ap in record["attack_patterns"] if ap.get("capec_id")
             ]
             # Neo4j 查詢沒辦法細分「哪個 CAPEC 對應哪個 ATT&CK 技術」，
@@ -234,7 +235,7 @@ def get_related_weakness_context_online(cwe_id):
             return {
                 "source": "Neo4j（蘇柏翰協作資料庫）",
                 "cwe_id": cwe_id,
-                "name": cwe_id,
+                "name": record["cwe_name"] or cwe_id,
                 "description": record["description"] or "",
                 "related_weaknesses": related_weaknesses,
                 "attack_patterns": attack_patterns,
