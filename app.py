@@ -446,14 +446,14 @@ CISA KEV 是否已知遭利用：{kev_text}
     weakness_text = "（未取得 CWE 知識圖譜資料）"
     if weakness_context:
         rw_text = "、".join(
-            f"{rw['name']}（{rw['cwe_id']}，關係：{rw['nature']}）" for rw in weakness_context["related_weaknesses"][:5]
+            f"{rw['name']}（{rw['cwe_id']}，關係：{rw['nature']}）" for rw in weakness_context["related_weaknesses"]
         ) or "無"
         capec_lines = []
-        for ap in weakness_context["attack_patterns"][:5]:
+        for ap in weakness_context["attack_patterns"]:
             techniques = "、".join(f"{t['name']}（{t['id']}）" for t in ap["attack_techniques"]) or "無對應 ATT&CK 技術"
             capec_lines.append(f"{ap['name']}（{ap['capec_id']}，嚴重程度：{ap['severity'] or '未評級'}）→ {techniques}")
         overall_techniques = "、".join(
-            t["name"] for t in weakness_context.get("attack_techniques", [])[:8]
+            t["name"] for t in weakness_context.get("attack_techniques", [])
         ) or "無"
         weakness_text = f"""CWE 分類：{weakness_context['cwe_id']} {weakness_context['name']}
 CWE 官方說明：{weakness_context['description'][:300]}
@@ -773,44 +773,20 @@ if uploaded_file is not None:
                             st.info(cve_info['Description'])
 
                             with st.container(border=True):
-                                st.markdown("🔗 **相關漏洞**")
+                                st.markdown("🔗 **這次掃描中的相關漏洞**")
                                 if related_cves:
                                     st.markdown(
-                                        f"這次掃描中還有 **{len(related_cves)}** 個漏洞跟這個同屬 "
+                                        f"還有 **{len(related_cves)}** 個漏洞跟這個同屬 "
                                         f"`{cve_info['CWE_Parsed']}` 分類：{', '.join(related_cves)}"
                                     )
                                 else:
                                     st.caption("這次掃描中沒有其他漏洞屬於同一個 CWE 分類。")
-
-                                if weakness_context:
-                                    st.markdown(f"**弱點分類**：{weakness_context['cwe_id']} — {weakness_context['name']}")
-                                    if weakness_context['related_weaknesses']:
-                                        rw_labels = ", ".join(
-                                            f"{rw['name']}（{rw['cwe_id']}，{rw['nature']}）"
-                                            for rw in weakness_context['related_weaknesses'][:5]
-                                        )
-                                        st.caption(f"相關/父子弱點分類：{rw_labels}")
-                                    if weakness_context['attack_patterns']:
-                                        for ap in weakness_context['attack_patterns'][:5]:
-                                            techniques = ", ".join(
-                                                f"{t['name']}（{t['id']}）" for t in ap['attack_techniques']
-                                            )
-                                            st.caption(
-                                                f"⚔️ {ap['name']}（{ap['capec_id']}，嚴重程度 {ap['severity'] or '未評級'}）"
-                                                + (f" → ATT&CK: {techniques}" if techniques else "")
-                                            )
-                                    if weakness_context.get('attack_techniques'):
-                                        overall = ", ".join(
-                                            f"{t['name']}" + (f"（{t['id']}）" if t['id'] else "")
-                                            for t in weakness_context['attack_techniques'][:8]
-                                        )
-                                        st.caption(f"⚔️ 對應 ATT&CK 技術（彙總）：{overall}")
-                                else:
-                                    st.caption("目前查無此弱點分類的延伸資訊。")
+                                st.caption("完整的弱點分類、攻擊手法說明請看「🔗 關聯 CWE/CVE 與參考來源」分頁。")
 
                             st.divider()
                             summary_key = f"ai_summary_{cve}"
                             enrichment_key = f"cve_enrichment_{cve}"
+                            weakness_key = f"cve_weakness_{cve}"
                             if st.button("🤖 AI 摘要與官方資源", key=f"ai_btn_{cve}"):
                                 if not GOOGLE_API_KEY:
                                     st.error("尚未設定 GOOGLE_API_KEY，請至 .env 補上金鑰後重新啟動 App。")
@@ -819,16 +795,34 @@ if uploaded_file is not None:
                                         try:
                                             enrichment = fetch_cve_enrichment(cve)
                                             st.session_state[enrichment_key] = enrichment
+
+                                            # CSV 裡的 CWE 欄位有時是空的或跟 NVD 不同步；
+                                            # 如果 CSV 查不到弱點關聯、但 NVD 有給出 CWE，改用 NVD 的 CWE 重新查一次，
+                                            # 確保 AI 摘要跟下面「官方 CVE 資料來源」顯示的 CWE 是同一份。
+                                            effective_weakness_context = weakness_context
+                                            if not effective_weakness_context and enrichment and enrichment.get('cwes'):
+                                                for cwe_candidate in enrichment['cwes']:
+                                                    norm = normalize_cwe_id(cwe_candidate)
+                                                    if norm:
+                                                        effective_weakness_context = get_related_weakness_context(norm)
+                                                        if effective_weakness_context:
+                                                            break
+                                            st.session_state[weakness_key] = effective_weakness_context
+
                                             endpoints = group[['Host', 'Port', 'Protocol']].drop_duplicates()
                                             endpoints_text = "\n".join(
                                                 f"- {r.Host}:{r.Port} ({r.Protocol})" for r in endpoints.itertuples()
                                             )
                                             st.session_state[summary_key] = generate_ai_summary(
                                                 cve, cve_info, endpoints_text, enrichment,
-                                                weakness_context, related_cves
+                                                effective_weakness_context, related_cves
                                             )
                                         except Exception as e:
                                             st.error(f"AI 摘要產生失敗：{e}")
+
+                            # AI 分析可能用 NVD 的 CWE 重新查過一次更完整的資料，
+                            # 之後 t3、拓樸圖都改用這份「有 AI 分析過就用它，沒有就退回 CSV 版本」的結果，避免兩邊不一致
+                            display_weakness_context = st.session_state.get(weakness_key, weakness_context)
 
                             if summary_key in st.session_state:
                                 summary = st.session_state[summary_key]
@@ -881,9 +875,9 @@ if uploaded_file is not None:
                                         for ref in enrichment['references']:
                                             st.markdown(f"- {ref}")
 
-                                        if enrichment.get('cwes') or weakness_context:
+                                        if enrichment.get('cwes') or display_weakness_context:
                                             st.markdown("**🕸️ 官方關聯拓樸圖**（CVE → CWE → 相關弱點／攻擊手法）")
-                                            relation_net = build_cve_relation_graph(cve, enrichment, weakness_context)
+                                            relation_net = build_cve_relation_graph(cve, enrichment, display_weakness_context)
                                             relation_file = f"temp_graph_cve_{re.sub(r'[^A-Za-z0-9]', '_', cve)}.html"
                                             relation_net.save_graph(relation_file)
                                             with open(relation_file, 'r', encoding='utf-8') as f:
@@ -903,6 +897,39 @@ if uploaded_file is not None:
                             st.markdown(f"* **受影響主機 IP / Port**（共 {len(endpoints)} 筆）：\n{endpoint_lines}")
                             if pd.notna(cve_info['See Also']):
                                 st.markdown(f"* **官方參考通報**：\n{cve_info['See Also']}")
+
+                            st.divider()
+                            st.markdown("**🕸️ CWE 弱點分類與攻擊手法關聯**")
+                            if display_weakness_context:
+                                st.markdown(f"{display_weakness_context['cwe_id']} — {display_weakness_context['name']}")
+                                st.caption(display_weakness_context['description'][:400])
+
+                                if display_weakness_context['related_weaknesses']:
+                                    st.markdown("相關／父子弱點分類：")
+                                    for rw in display_weakness_context['related_weaknesses']:
+                                        st.markdown(f"  - {rw['name']}（`{rw['cwe_id']}`，{rw['nature']}）")
+
+                                if display_weakness_context['attack_patterns']:
+                                    st.markdown("對應的 CAPEC 攻擊手法：")
+                                    for ap in display_weakness_context['attack_patterns']:
+                                        techniques = ", ".join(
+                                            f"{t['name']}（{t['id']}）" for t in ap['attack_techniques']
+                                        )
+                                        st.markdown(
+                                            f"  - ⚔️ {ap['name']}（`{ap['capec_id']}`，嚴重程度 {ap['severity'] or '未評級'}）"
+                                            + (f" → ATT&CK：{techniques}" if techniques else "")
+                                        )
+
+                                if display_weakness_context.get('attack_techniques'):
+                                    overall = ", ".join(
+                                        f"{t['name']}" + (f"（{t['id']}）" if t['id'] else "")
+                                        for t in display_weakness_context['attack_techniques']
+                                    )
+                                    st.markdown(f"對應 ATT&CK 技術（彙總）：{overall}")
+                            elif weakness_context is None and st.session_state.get(enrichment_key) is None:
+                                st.caption("目前查無此弱點分類的延伸資訊；點擊「🤖 AI 摘要與官方資源」可額外查詢 NVD 的 CWE 對應。")
+                            else:
+                                st.caption("目前查無此弱點分類的延伸資訊。")
 
                 st.divider()
 
