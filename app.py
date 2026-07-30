@@ -2,6 +2,7 @@ import os
 import re
 import json
 import requests
+from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
 import pandas as pd
 from pyvis.network import Network
@@ -12,6 +13,34 @@ from google import genai
 from google.genai import types
 
 load_dotenv()
+
+
+def cwe_url(cwe_id):
+    m = re.search(r"\d+", cwe_id or "")
+    return f"https://cwe.mitre.org/data/definitions/{m.group()}.html" if m else None
+
+
+def capec_url(capec_id):
+    m = re.search(r"\d+", capec_id or "")
+    return f"https://capec.mitre.org/data/definitions/{m.group()}.html" if m else None
+
+
+def attack_technique_id(technique):
+    """ATT&CK 技術 ID 在本機資料跟 Neo4j 查回來的格式不一致（有沒有帶 'T' 開頭、
+    有沒有獨立欄位），統一從 id 或 name 裡解析出標準格式，解析不出來就回傳 None。"""
+    raw_id = technique.get("id")
+    if raw_id:
+        return raw_id if str(raw_id).upper().startswith("T") else f"T{raw_id}"
+    m = re.match(r"(T\d+(?:\.\d+)?)", technique.get("name") or "")
+    return m.group(1) if m else None
+
+
+def attack_url(technique_id):
+    if not technique_id:
+        return None
+    parts = technique_id.split(".")
+    base = parts[0]
+    return f"https://attack.mitre.org/techniques/{base}/{parts[1]}/" if len(parts) > 1 else f"https://attack.mitre.org/techniques/{base}/"
 
 
 def get_secret(key, default=""):
@@ -367,28 +396,40 @@ def fetch_kev_status(cve_id):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_cve_enrichment(cve_id):
-    """依序嘗試 NVD、OpenCVE 取得基本資料，並疊加 EPSS 機率分數與 CISA KEV 是否已遭利用。"""
-    enrichment = None
+    """依序嘗試 NVD、OpenCVE 取得基本資料，並疊加 EPSS 機率分數與 CISA KEV 是否已遭利用。
+    NVD/OpenCVE、EPSS、KEV 三個查詢彼此不互相依賴，平行呼叫以縮短總等待時間
+    （雲端環境每個外部 API 延遲都比本機高，序列呼叫的等待時間會直接疊加）。"""
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        base_future = executor.submit(_fetch_cve_base, cve_id)
+        epss_future = executor.submit(fetch_epss, cve_id)
+        kev_future = executor.submit(fetch_kev_status, cve_id)
+
+        enrichment = base_future.result()
+        if enrichment is None:
+            return None
+
+        try:
+            enrichment["epss"] = epss_future.result()
+        except Exception:
+            enrichment["epss"] = None
+
+        try:
+            enrichment["kev"] = kev_future.result()
+        except Exception:
+            enrichment["kev"] = None
+
+    return enrichment
+
+
+def _fetch_cve_base(cve_id):
     for fetcher in (fetch_cve_from_nvd, fetch_cve_from_opencve):
         try:
             result = fetcher(cve_id)
             if result:
-                enrichment = result
-                break
+                return result
         except Exception:
             continue
-
-    if enrichment is None:
-        return None
-
-    try:
-        enrichment["epss"] = fetch_epss(cve_id)
-    except Exception:
-        enrichment["epss"] = None
-
-    enrichment["kev"] = fetch_kev_status(cve_id)
-
-    return enrichment
+    return None
 
 RISK_COLORS = {
     "Critical": "#FF4B4B",
@@ -503,6 +544,8 @@ CWE/CAPEC/ATT&CK 知識圖譜補充資訊：
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=AI_SUMMARY_SCHEMA,
+        # 逾時設短一點，第一個模型卡住/太忙就快速切到備援模型，而不是乾等
+        http_options=types.HttpOptions(timeout=15000),
     )
     last_error = None
     for model in ["gemini-flash-lite-latest", "gemma-4-26b-a4b-it"]:
@@ -852,7 +895,10 @@ if uploaded_file is not None:
                                             f"（分數 {enrichment['cvss_score']}，{enrichment['cvss_severity'] or '無'}）"
                                         )
                                         if enrichment['cwes']:
-                                            st.markdown(f"**關聯 CWE**：{', '.join(enrichment['cwes'])}")
+                                            cwe_refs = ", ".join(
+                                                f"[{c}]({cwe_url(c)})" if cwe_url(c) else c for c in enrichment['cwes']
+                                            )
+                                            st.markdown(f"**關聯 CWE**：{cwe_refs}")
 
                                         epss = enrichment.get('epss')
                                         if epss:
@@ -901,31 +947,42 @@ if uploaded_file is not None:
                             st.divider()
                             st.markdown("**🕸️ CWE 弱點分類與攻擊手法關聯**")
                             if display_weakness_context:
-                                st.markdown(f"{display_weakness_context['cwe_id']} — {display_weakness_context['name']}")
+                                cwe_link = cwe_url(display_weakness_context['cwe_id'])
+                                cwe_title = f"{display_weakness_context['cwe_id']} — {display_weakness_context['name']}"
+                                st.markdown(f"[{cwe_title}]({cwe_link})" if cwe_link else cwe_title)
                                 st.caption(display_weakness_context['description'][:400])
 
                                 if display_weakness_context['related_weaknesses']:
                                     st.markdown("相關／父子弱點分類：")
                                     for rw in display_weakness_context['related_weaknesses']:
-                                        st.markdown(f"  - {rw['name']}（`{rw['cwe_id']}`，{rw['nature']}）")
+                                        rw_link = cwe_url(rw['cwe_id'])
+                                        rw_ref = f"[`{rw['cwe_id']}`]({rw_link})" if rw_link else f"`{rw['cwe_id']}`"
+                                        st.markdown(f"  - {rw['name']}（{rw_ref}，{rw['nature']}）")
 
                                 if display_weakness_context['attack_patterns']:
                                     st.markdown("對應的 CAPEC 攻擊手法：")
                                     for ap in display_weakness_context['attack_patterns']:
-                                        techniques = ", ".join(
-                                            f"{t['name']}（{t['id']}）" for t in ap['attack_techniques']
-                                        )
+                                        technique_links = []
+                                        for t in ap['attack_techniques']:
+                                            tid = attack_technique_id(t)
+                                            turl = attack_url(tid)
+                                            technique_links.append(f"[{t['name']}]({turl})" if turl else t['name'])
+                                        techniques = ", ".join(technique_links)
+
+                                        cap_link = capec_url(ap['capec_id'])
+                                        cap_ref = f"[`{ap['capec_id']}`]({cap_link})" if cap_link else f"`{ap['capec_id']}`"
                                         st.markdown(
-                                            f"  - ⚔️ {ap['name']}（`{ap['capec_id']}`，嚴重程度 {ap['severity'] or '未評級'}）"
+                                            f"  - ⚔️ {ap['name']}（{cap_ref}，嚴重程度 {ap['severity'] or '未評級'}）"
                                             + (f" → ATT&CK：{techniques}" if techniques else "")
                                         )
 
                                 if display_weakness_context.get('attack_techniques'):
-                                    overall = ", ".join(
-                                        f"{t['name']}" + (f"（{t['id']}）" if t['id'] else "")
-                                        for t in display_weakness_context['attack_techniques']
-                                    )
-                                    st.markdown(f"對應 ATT&CK 技術（彙總）：{overall}")
+                                    overall_links = []
+                                    for t in display_weakness_context['attack_techniques']:
+                                        tid = attack_technique_id(t)
+                                        turl = attack_url(tid)
+                                        overall_links.append(f"[{t['name']}]({turl})" if turl else t['name'])
+                                    st.markdown(f"對應 ATT&CK 技術（彙總）：{', '.join(overall_links)}")
                             elif weakness_context is None and st.session_state.get(enrichment_key) is None:
                                 st.caption("目前查無此弱點分類的延伸資訊；點擊「🤖 AI 摘要與官方資源」可額外查詢 NVD 的 CWE 對應。")
                             else:
