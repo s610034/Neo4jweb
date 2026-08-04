@@ -2,7 +2,7 @@ import os
 import re
 import json
 import requests
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 import pandas as pd
 from pyvis.network import Network
@@ -559,17 +559,29 @@ CWE/CAPEC/ATT&CK 知識圖譜補充資訊：
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=AI_SUMMARY_SCHEMA,
-        # 逾時設短一點，第一個模型卡住/太忙就快速切到備援模型，而不是乾等
         http_options=types.HttpOptions(timeout=30000),
     )
+
+    # 兩個候選模型同時發送請求、誰先成功回應就用誰，而不是「A 失敗才試 B」的序列方式。
+    # Google 免費層級模型時常有間歇性壅塞，序列重試最壞情況要等兩個逾時加起來；
+    # 平行賽跑只要有一個模型是通的，使用者幾乎感受不到另一個在卡。
+    models = ["gemini-flash-lite-latest", "gemma-4-26b-a4b-it"]
+    executor = ThreadPoolExecutor(max_workers=len(models))
+    futures = {
+        executor.submit(client.models.generate_content, model=m, contents=prompt, config=config): m
+        for m in models
+    }
     last_error = None
-    for model in ["gemini-flash-lite-latest", "gemma-4-26b-a4b-it"]:
-        try:
-            response = client.models.generate_content(model=model, contents=prompt, config=config)
-            return json.loads(response.text)
-        except Exception as e:
-            last_error = e
-            continue
+    try:
+        for future in as_completed(futures):
+            try:
+                return json.loads(future.result().text)
+            except Exception as e:
+                last_error = e
+                continue
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
     raise RuntimeError(f"所有候選模型皆呼叫失敗（可能額度用盡）：{last_error}")
 
 
