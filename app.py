@@ -55,6 +55,7 @@ def get_secret(key, default=""):
 
 GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
 OPENCVE_TOKEN = get_secret("OPENCVE_TOKEN")
+GROQ_API_KEY = get_secret("GROQ_API_KEY")
 
 KG_PATH = os.path.join(os.path.dirname(__file__), "data", "cwe_knowledge_graph.json")
 
@@ -464,6 +465,43 @@ AI_SUMMARY_SCHEMA = {
     "required": ["what", "harm", "action", "reference", "related"],
 }
 
+AI_SUMMARY_KEYS = ("what", "harm", "action", "reference", "related")
+
+
+def _validate_summary_dict(data):
+    """Groq 的 json_object 模式只保證語法合法的 JSON，不保證欄位符合我們要的結構，
+    這裡補一層檢查，缺欄位就當作這次呼叫失敗，讓賽跑機制换下一個候選。"""
+    if not isinstance(data, dict) or any(k not in data for k in AI_SUMMARY_KEYS):
+        raise ValueError(f"Groq 回傳的 JSON 缺少必要欄位：{data}")
+    return data
+
+
+def call_groq_model(prompt, model="llama-3.3-70b-versatile"):
+    """Groq 是跟 Google 完全獨立的公司/基礎設施，用免費、速度很快的 Llama 模型
+    當第三個賽跑候選，避免 Gemini/Gemma 同時壅塞時完全沒有備援可用。"""
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        json={
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你只回傳一個合法的 JSON 物件，且必須包含 what、harm、action、reference、related "
+                        "五個字串欄位，不要有其他文字、不要用 markdown 程式碼區塊包起來。"
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "response_format": {"type": "json_object"},
+        },
+        timeout=25,
+    )
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"]
+    return json.loads(content)
+
 
 def generate_ai_summary(cve, cve_info, endpoints_text, enrichment=None, weakness_context=None, related_cves=None):
     """回傳固定結構 {what, harm, action, reference, related}，畫面排版由 App 自己控制，
@@ -562,20 +600,25 @@ CWE/CAPEC/ATT&CK 知識圖譜補充資訊：
         http_options=types.HttpOptions(timeout=30000),
     )
 
-    # 兩個候選模型同時發送請求、誰先成功回應就用誰，而不是「A 失敗才試 B」的序列方式。
-    # Google 免費層級模型時常有間歇性壅塞，序列重試最壞情況要等兩個逾時加起來；
-    # 平行賽跑只要有一個模型是通的，使用者幾乎感受不到另一個在卡。
-    models = ["gemini-flash-lite-latest", "gemma-4-26b-a4b-it"]
-    executor = ThreadPoolExecutor(max_workers=len(models))
-    futures = {
-        executor.submit(client.models.generate_content, model=m, contents=prompt, config=config): m
-        for m in models
-    }
+    # 多個候選模型同時發送請求、誰先成功回應就用誰，而不是「A 失敗才試 B」的序列方式。
+    # 特意混用不同公司的服務（Google 的 Gemini/Gemma + Groq 的 Llama）而不是同一家的兩個模型，
+    # 這樣單一供應商整體壅塞時，還有另一家完全獨立的基礎設施可以頂上。
+    executor = ThreadPoolExecutor(max_workers=3)
+    unwrap_by_future = {}
+
+    for model in ["gemini-flash-lite-latest", "gemma-4-26b-a4b-it"]:
+        future = executor.submit(client.models.generate_content, model=model, contents=prompt, config=config)
+        unwrap_by_future[future] = lambda f: json.loads(f.result().text)
+
+    if GROQ_API_KEY:
+        groq_future = executor.submit(call_groq_model, prompt)
+        unwrap_by_future[groq_future] = lambda f: _validate_summary_dict(f.result())
+
     last_error = None
     try:
-        for future in as_completed(futures):
+        for future in as_completed(unwrap_by_future):
             try:
-                return json.loads(future.result().text)
+                return unwrap_by_future[future](future)
             except Exception as e:
                 last_error = e
                 continue
