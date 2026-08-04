@@ -70,6 +70,18 @@ def load_cwe_knowledge_graph():
         return {"cwe": {}, "capec": {}}
 
 
+def get_exploit_frameworks(cve_info):
+    """Nessus 原始掃描結果會標記這個漏洞在 Metasploit / Core Impact / CANVAS
+    這幾套滲透測試框架裡有沒有現成的攻擊模組，值是字串 'true'。
+    這是比 EPSS/KEV 更直接的「能不能被輕易攻擊」訊號，且不需要額外查詢外部 API。"""
+    frameworks = []
+    for column in ["Metasploit", "Core Impact", "CANVAS"]:
+        value = cve_info.get(column)
+        if pd.notna(value) and str(value).strip().lower() == "true":
+            frameworks.append(column)
+    return frameworks
+
+
 def normalize_cwe_id(raw_cwe):
     """Nessus CSV 的 XREF 常寫成 'CWE:79'，NVD/知識圖譜統一用 'CWE-79'，這裡做格式對齊。"""
     if not raw_cwe or raw_cwe == "N/A":
@@ -516,8 +528,8 @@ CWE 官方說明：{weakness_context['description'][:300]}
 - what：用非技術人員能懂的比喻或白話，解釋這個弱點的成因（例如是什麼設定錯誤、過時軟體、還是驗證漏洞）。1-2 句話。
 - harm：如果被入侵者利用，實際上可能發生什麼後果（例如：資料外洩、被植入勒索軟體、被當跳板攻擊其他系統、服務中斷等），
   要具體到這個弱點的攻擊情境，不要講空泛的「資安風險」。1-2 句話。
-- action：根據風險等級、CVSS 分數、EPSS 機率、是否已被 CISA 列為已知遭利用，給出優先順序建議
-  （如果已列入 CISA KEV，要明確指出這代表已經有真實攻擊案例，應優先於其他同等級但沒被列入的漏洞）。1 句話。
+- action：根據風險等級、CVSS 分數、EPSS 機率、是否已被 CISA 列為已知遭利用、是否有現成攻擊模組，給出優先順序建議
+  （如果已列入 CISA KEV 或有現成攻擊模組如 Metasploit，要明確指出這代表攻擊門檻很低、隨時可能被利用，應優先於其他同等級但沒有這些條件的漏洞）。1 句話。
 - reference：明確引用官方 CVE 資料庫的具體數據來佐證，例如「根據 NVD，此漏洞 CVSS 分數為 9.1（Critical），EPSS 機率 99.9%，
   且已列入 CISA KEV」。如果下方沒有取得官方資料（顯示「未取得官方 CVE 資料庫額外資訊」），就直接寫
   「本次分析僅根據 Nessus 掃描結果，未查得官方 CVE 資料庫資訊」。1 句話。
@@ -531,6 +543,7 @@ CVE: {cve}
 CWE: {cve_info['CWE_Parsed']}
 Nessus 漏洞描述: {cve_info['Description']}
 官方修補方案: {cve_info['Solution'] if pd.notna(cve_info['Solution']) else '無'}
+Nessus 標記的現成攻擊模組: {', '.join(get_exploit_frameworks(cve_info)) or '無'}
 受影響主機/Port:
 {endpoints_text}
 
@@ -547,7 +560,7 @@ CWE/CAPEC/ATT&CK 知識圖譜補充資訊：
         response_mime_type="application/json",
         response_schema=AI_SUMMARY_SCHEMA,
         # 逾時設短一點，第一個模型卡住/太忙就快速切到備援模型，而不是乾等
-        http_options=types.HttpOptions(timeout=15000),
+        http_options=types.HttpOptions(timeout=30000),
     )
     last_error = None
     for model in ["gemini-flash-lite-latest", "gemma-4-26b-a4b-it"]:
@@ -815,6 +828,11 @@ if uploaded_file is not None:
                         with t1:
                             st.markdown(f"**漏洞名稱**：{cve_info['Name']}")
                             st.markdown(f"**風險等級**：`{cve_info['Risk']}`")
+
+                            exploit_frameworks = get_exploit_frameworks(cve_info)
+                            if exploit_frameworks:
+                                st.error(f"💣 已有現成攻擊模組可直接利用：{', '.join(exploit_frameworks)}")
+
                             st.info(cve_info['Description'])
 
                             with st.container(border=True):
