@@ -849,13 +849,16 @@ if uploaded_file is not None:
     df['CWE_Parsed'] = df['XREF'].apply(extract_cwe)
 
     # 從 Nessus 的「OS Identification」插件輸出解析實際 OS 名稱，
-    # 支援「Remote operating system : XXX」與「cpe:/o:vendor:product:version」兩種常見格式
+    # 支援「Remote operating system : XXX」與「cpe:/o:vendor:product:version」兩種常見格式。
+    # 抓不到就回傳 None，不要亂猜第一行文字（Nessus 猜不出 OS 時的除錯輸出常常是一堆
+    # SinFP 指紋十六進位或「請協助回報特徵碼」的說明文字，硬當成 OS 名稱只會誤導）。
     def parse_os_from_plugin_output(output):
         text = str(output)
 
-        m = re.search(r'(?:Remote operating system|Operating System)\s*:\s*(.+)', text, re.IGNORECASE)
+        m = re.search(r'Remote operating system\s*:\s*(.+)', text, re.IGNORECASE)
         if m and m.group(1).strip():
-            return m.group(1).strip()
+            # SinFP 信心不足時會列出好幾個候選 OS（一行一個），只取最有可能的第一個
+            return m.group(1).strip().splitlines()[0].strip()
 
         m = re.search(r'cpe:/o:([\w.\-]+):([\w.\-]+)(?::([\w.\-]+))?', text)
         if m:
@@ -865,31 +868,34 @@ if uploaded_file is not None:
                 parts.append(version)
             return ' '.join(parts)
 
-        for line in text.strip().splitlines():
-            line = line.strip()
-            if line and not line.endswith(':'):
-                return line
+        return None
 
-        return "Unknown"
-
-    # 嘗試取得每台主機的作業系統資訊：優先讀取現成欄位，
-    # 否則從 Nessus 的「OS Identification」類插件輸出解析
+    # 嘗試取得每台主機的作業系統資訊：優先讀取現成欄位，否則從 Nessus 插件輸出解析。
+    # 同一台主機常常同時有「OS Identification」跟「Common Platform Enumeration (CPE)」兩筆結果，
+    # 用精確比對插件名稱（不是模糊比對）＋固定優先序，避免：
+    # (1) 誤把「OS Identification Failed」這種除錯用插件的內容當成有效 OS 資料；
+    # (2) CPE 那筆有時只列出應用程式層級的 cpe:/a:（例如 nginx、openssh）、沒有作業系統層級的
+    #     cpe:/o:，若剛好排在 OS Identification 後面覆蓋掉，會把應用程式名稱誤植為 OS。
     def build_os_lookup(full_df):
         for col in ["OS", "Operating System", "operating_system", "os"]:
             if col in full_df.columns:
                 return full_df.dropna(subset=[col]).groupby("Host")[col].first().to_dict()
 
-        if "Plugin Output" in full_df.columns and "Name" in full_df.columns:
-            os_rows = full_df[full_df["Name"].astype(str).str.contains(
-                "OS Identification|Common Platform Enumeration", case=False, na=False)]
-            lookup = {}
-            for _, row in os_rows.iterrows():
+        if "Plugin Output" not in full_df.columns or "Name" not in full_df.columns:
+            return {}
+
+        lookup = {}
+        for plugin_name in ["OS Identification", "Common Platform Enumeration (CPE)"]:
+            for _, row in full_df[full_df["Name"] == plugin_name].iterrows():
+                host = row["Host"]
+                if host in lookup:
+                    continue
                 output = row.get("Plugin Output")
                 if pd.notna(output):
-                    lookup[row["Host"]] = parse_os_from_plugin_output(output)
-            return lookup
-
-        return {}
+                    parsed = parse_os_from_plugin_output(output)
+                    if parsed:
+                        lookup[host] = parsed
+        return lookup
 
     os_lookup = build_os_lookup(df)
 
@@ -1239,6 +1245,16 @@ if uploaded_file is not None:
                     st.dataframe(os_summary, hide_index=True, use_container_width=True)
                 else:
                     st.caption("此 Nessus CSV 未包含 OS 欄位，也找不到 OS Identification 插件輸出，無法統計作業系統。")
+
+            st.markdown("**觸發明細：哪個 IP 觸發了哪個 CVE、在哪個 Port**")
+            detail_table = (
+                filtered_df[['Host', 'CVE', 'Port', 'Protocol', 'Risk']]
+                .drop_duplicates()
+                .sort_values(['Host', 'Risk'], key=lambda col: col.map(RISK_RANK) if col.name == 'Risk' else col,
+                             ascending=[True, False])
+                .rename(columns={'Host': 'IP', 'Protocol': '協定', 'Risk': '風險等級'})
+            )
+            st.dataframe(detail_table, hide_index=True, use_container_width=True)
 
 else:
     st.info("👈 請先於左側邊欄上傳您的 Nessus CSV 檔案以開始分析。")
