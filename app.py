@@ -304,11 +304,13 @@ def fetch_cve_from_nvd(cve_id):
             cvss_severity = m.get("baseSeverity", m["cvssData"].get("baseSeverity", ""))
             break
 
+    # NVD 對沒有分類資訊的漏洞會回傳 NVD-CWE-noinfo / NVD-CWE-Other 這種內部佔位標籤，
+    # 不是真正的 CWE 編號，過濾掉避免顯示無意義的原始標籤或產生壞掉的連結
     cwes = sorted({
         d["value"]
         for w in cve.get("weaknesses", [])
         for d in w.get("description", [])
-        if d.get("lang") == "en"
+        if d.get("lang") == "en" and re.match(r"^CWE-\d+$", d["value"])
     })
     references = [r["url"] for r in cve.get("references", [])][:5]
 
