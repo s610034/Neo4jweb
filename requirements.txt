@@ -4,3 +4,4 @@ pyvis>=0.3.2
 neo4j>=5.28.4
 python-dotenv>=1.2.1
 google-genai>=1.47.0
+requests>=2.32.5

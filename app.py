@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
@@ -742,6 +743,72 @@ def build_cve_relation_graph(cve, enrichment, weakness_context):
     """)
     return net
 
+
+RISK_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
+# 固定的狀態色盤（critical/serious/warning/good），跟一般分類色刻意做區隔、
+# 已通過色盲安全驗證，不隨主題改變。文字顏色依每個底色分別挑白字或深字以確保可讀。
+RISK_TREEMAP_COLORS = {
+    "Critical": ("#C1121F", "#ffd6d9"),
+    "High": ("#E69F00", "#402c00"),
+    "Medium": ("#0072B2", "#cfe8fb"),
+    "Low": ("#56B4E9", "#052033"),
+}
+
+
+def render_host_treemap(filtered_df):
+    """主機風險總覽：方塊大小依漏洞數量縮放，顏色依該主機最高風險等級，
+    放在畫面最上方讓使用者一眼看出「哪台主機問題最大」，不用先看完整份圖譜跟清單。"""
+    host_stats = (
+        filtered_df.groupby("Host")
+        .agg(count=("CVE", "count"), max_risk=("Risk", lambda s: max(s, key=lambda r: RISK_RANK.get(r, 0))))
+        .reset_index()
+        .sort_values("count", ascending=False)
+    )
+
+    if host_stats.empty:
+        return ""
+
+    max_count = host_stats["count"].max()
+
+    def span_for(count):
+        ratio = count / max_count
+        if ratio > 0.7: return 5
+        if ratio > 0.45: return 4
+        if ratio > 0.25: return 3
+        if ratio > 0.1: return 2
+        return 1
+
+    boxes = []
+    for _, row in host_stats.iterrows():
+        span = span_for(row["count"])
+        bg, fg = RISK_TREEMAP_COLORS.get(row["max_risk"], RISK_TREEMAP_COLORS["Low"])
+        font_size = 12 + span
+        boxes.append(f"""
+        <div style="grid-column: span {span}; grid-row: span {span}; background: {bg};
+                    border-radius: 6px; padding: 10px; display: flex; flex-direction: column;
+                    justify-content: space-between; min-height: 32px;">
+          <span style="color: {fg}; font-size: 12px; font-weight: 500;">{row['Host']}</span>
+          <div><span style="color: {fg}; font-size: {font_size}px; font-weight: 500;">{row['count']}</span>
+          <span style="color: {fg}; font-size: 11px;"> 筆漏洞</span></div>
+        </div>""")
+
+    legend = "".join(
+        f'<span style="margin-right:16px;"><span style="display:inline-block;width:10px;height:10px;'
+        f'border-radius:2px;background:{bg};margin-right:4px;"></span>{risk}</span>'
+        for risk, (bg, fg) in RISK_TREEMAP_COLORS.items()
+    )
+
+    return f"""
+    <div style="background: #0e1117; border-radius: 8px; padding: 1.25rem; font-family: sans-serif;">
+      <p style="color: #e6e6e6; font-size: 14px; font-weight: 500; margin: 0 0 12px;">
+        📊 主機風險總覽（方塊大小＝漏洞數量，顏色＝最高風險等級）</p>
+      <div style="display: grid; grid-template-columns: repeat(12, 1fr); grid-auto-rows: 30px; gap: 4px;">
+        {''.join(boxes)}
+      </div>
+      <div style="margin-top: 14px; font-size: 11px; color: #9a9ba0;">{legend}</div>
+    </div>
+    """
+
 # --- 頁面標題與佈局配置 ---
 st.set_page_config(page_title="資安漏洞互動式圖譜系統", layout="wide")
 st.title("🛡️ 弱點掃描 (Nessus) 互動分析與修補指引系統")
@@ -854,6 +921,82 @@ if uploaded_file is not None:
         if filtered_df.empty:
             st.warning("目前選取的風險等級沒有符合的 CVE，請調整篩選條件。")
         else:
+            # --- 總覽區塊：放在畫面最上方，讓使用者先看到「哪台主機問題最大」---
+            components.html(render_host_treemap(filtered_df), height=260)
+
+            # --- 批次產生全部 CVE 的 AI 摘要並匯出報告 ---
+            with st.expander("📥 批次產生 AI 摘要並匯出報告"):
+                st.caption(
+                    f"會依序對這 {len(matched_cves)} 個 CVE 呼叫 AI 分析（已經產生過的會跳過），"
+                    "每筆之間會稍微間隔，避免免費額度的速率限制。CVE 數量多的話會需要一點時間。"
+                )
+                if st.button("開始批次產生", key="batch_ai_btn"):
+                    progress = st.progress(0, text="準備中...")
+                    total = len(matched_cves)
+                    for i, cve in enumerate(matched_cves):
+                        summary_key = f"ai_summary_{cve}"
+                        if summary_key not in st.session_state:
+                            group = filtered_df[filtered_df['CVE'] == cve]
+                            cve_info = group.iloc[0]
+                            try:
+                                enrichment = fetch_cve_enrichment(cve)
+                                st.session_state[f"cve_enrichment_{cve}"] = enrichment
+                                normalized = normalize_cwe_id(cve_info['CWE_Parsed'])
+                                wctx = get_related_weakness_context(normalized) if normalized else None
+                                if not wctx and enrichment and enrichment.get('cwes'):
+                                    for c in enrichment['cwes']:
+                                        n = normalize_cwe_id(c)
+                                        if n:
+                                            wctx = get_related_weakness_context(n)
+                                            if wctx:
+                                                break
+                                st.session_state[f"cve_weakness_{cve}"] = wctx
+                                related = sorted(
+                                    set(cve_df[cve_df['CWE_Parsed'] == cve_info['CWE_Parsed']]['CVE']) - {cve}
+                                ) if cve_info['CWE_Parsed'] != "N/A" else []
+                                endpoints = group[['Host', 'Port', 'Protocol']].drop_duplicates()
+                                endpoints_text = "\n".join(
+                                    f"- {r.Host}:{r.Port} ({r.Protocol})" for r in endpoints.itertuples()
+                                )
+                                st.session_state[summary_key] = generate_ai_summary(
+                                    cve, cve_info, endpoints_text, enrichment, wctx, related
+                                )
+                            except Exception:
+                                # 這個結果會被寫進客戶看的匯出報告，不放原始例外文字，避免洩漏內部細節
+                                st.session_state[summary_key] = {
+                                    "what": "（本筆暫時無法產生 AI 摘要，請稍後重試或改用個別按鈕重新產生）",
+                                    "harm": "", "action": "", "reference": "", "related": "",
+                                }
+                            time.sleep(1)
+                        progress.progress((i + 1) / total, text=f"{i+1}/{total}：{cve}")
+                    progress.empty()
+                    st.success("批次產生完成，可以展開下方各個 CVE 卡片查看，或匯出報告。")
+
+                report_lines = []
+                for cve in matched_cves:
+                    summary_key = f"ai_summary_{cve}"
+                    if summary_key in st.session_state:
+                        s = st.session_state[summary_key]
+                        cve_info = cve_df[cve_df['CVE'] == cve].iloc[0]
+                        report_lines.append(
+                            f"## {cve} — {cve_info['Name']}（{cve_info['Risk']}）\n\n"
+                            f"**這是什麼？**\n{s['what']}\n\n"
+                            f"**可能造成的危害**\n{s['harm']}\n\n"
+                            f"**建議處理方式**\n{s['action']}\n\n"
+                            f"**官方資料佐證**\n{s['reference']}\n\n"
+                            f"**相關弱點與攻擊手法**\n{s['related']}\n"
+                        )
+                if report_lines:
+                    report_text = f"# 弱點分析報告\n\n共 {len(report_lines)} 個 CVE 已產生摘要\n\n" + "\n---\n\n".join(report_lines)
+                    st.download_button(
+                        "⬇️ 下載報告（Markdown）",
+                        data=report_text,
+                        file_name="vulnerability_report.md",
+                        mime="text/markdown",
+                    )
+                else:
+                    st.caption("目前還沒有任何 CVE 產生過 AI 摘要，批次產生或到下面各別點擊後才能匯出。")
+
             # --- 依風險等級切成區塊：每個區塊各自一張圖 + 一區文字說明 ---
             for risk in risk_options:
                 risk_group_df = filtered_df[filtered_df['Risk'] == risk]
