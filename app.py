@@ -1053,11 +1053,12 @@ if uploaded_file is not None:
                             if exploit_frameworks:
                                 st.error(f"💣 已有現成攻擊模組可直接利用：{', '.join(exploit_frameworks)}")
 
-                            st.info(cve_info['Description'])
                             existing_summary = st.session_state.get(f"ai_summary_{cve}")
+                            description_block = cve_info['Description']
                             if existing_summary and existing_summary.get('description_zh'):
-                                st.caption(f"🌐 繁體中文翻譯：{existing_summary['description_zh']}")
-                            elif not existing_summary:
+                                description_block += f"\n\n🌐 **繁體中文翻譯**\n\n{existing_summary['description_zh']}"
+                            st.info(description_block)
+                            if not existing_summary:
                                 st.caption("🌐 點下方「AI 摘要與官方資源」可同時取得繁體中文翻譯")
 
                             with st.container(border=True):
@@ -1177,11 +1178,12 @@ if uploaded_file is not None:
                                     st.caption("⚠️ 未取得官方 CVE 資料庫資訊，以上摘要僅根據 Nessus 掃描結果分析。")
 
                         with t2:
-                            st.success(cve_info['Solution'] if pd.notna(cve_info['Solution']) else "無明確修補方案，請參考官方規範。")
                             existing_summary_t2 = st.session_state.get(f"ai_summary_{cve}")
+                            solution_block = cve_info['Solution'] if pd.notna(cve_info['Solution']) else "無明確修補方案，請參考官方規範。"
                             if existing_summary_t2 and existing_summary_t2.get('solution_zh'):
-                                st.caption(f"🌐 繁體中文翻譯：{existing_summary_t2['solution_zh']}")
-                            elif not existing_summary_t2:
+                                solution_block += f"\n\n🌐 **繁體中文翻譯**\n\n{existing_summary_t2['solution_zh']}"
+                            st.success(solution_block)
+                            if not existing_summary_t2:
                                 st.caption("🌐 點「📌 問題概述」分頁的「AI 摘要與官方資源」可同時取得繁體中文翻譯")
 
                         with t3:
