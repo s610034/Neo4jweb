@@ -209,8 +209,9 @@ def ensure_cloudflare_tunnel():
     return None
 
 
+@st.cache_resource(show_spinner=False)
 def get_neo4j_driver():
-    """建立共用 Neo4j 的連線（蘇柏翰維護的協作資料庫）。連不上就回傳 None，
+    """建立共用 Neo4j 的連線（團隊協作維護的資料庫）。連不上就回傳 None，
     讓呼叫端自動退回本機知識圖譜，不會讓整個 App 卡住或報錯。
     用 cache_resource 讓整個 session 只嘗試連線一次，避免每張卡片都重新等逾時。
     優先透過 cloudflared 通道連線（繞過協定封鎖），通道建立失敗才退而求其次
@@ -238,7 +239,7 @@ def get_neo4j_driver():
 
 
 def get_related_weakness_context_online(cwe_id):
-    """查詢蘇柏翰維護的共用 Neo4j，取得跟本機知識圖譜相同結構的資料。
+    """查詢團隊共用的 Neo4j，取得跟本機知識圖譜相同結構的資料。
     Neo4j 連不上、查無資料、或查詢過程出錯，都回傳 None（由呼叫端 fallback）。"""
     driver = get_neo4j_driver()
     if driver is None:
@@ -277,7 +278,7 @@ def get_related_weakness_context_online(cwe_id):
             ]
 
             return {
-                "source": "Neo4j（蘇柏翰協作資料庫）",
+                "source": "Neo4j（團隊共用協作資料庫）",
                 "cwe_id": cwe_id,
                 "name": record["cwe_name"] or cwe_id,
                 "description": record["description"] or "",

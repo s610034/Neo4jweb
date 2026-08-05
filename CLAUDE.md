@@ -33,7 +33,7 @@ CWE-CAPEC-ATT&CK 知識圖譜，補足 Nessus CSV 本身描述過於精簡的問
 
 ## Neo4j 連線：Cloudflare 擋原生 Bolt 協定，用 cloudflared 通道繞過
 
-共用的 Neo4j（`graphker.lab.114514.my.id`，同事「蘇柏翰」維護，資料庫本身應該是用開源工具
+共用的 Neo4j（`graphker.lab.114514.my.id`，由團隊成員維護，資料庫本身應該是用開源工具
 [GraphKer](https://github.com/amberzovitis/GraphKer) 建的，schema 完全對得上：`CVE
 -[:Problem_Type]-> CWE -[:Related_Weakness]-> CWE`、`CWE -[:RelatedAttackPattern]-> CAPEC
 -[:Mapped_Attack]-> ATTACK`）被 Cloudflare 代理擋住了：
@@ -96,8 +96,9 @@ AI prompt 裡。
 
 ## 客戶報告不能暴露內部架構
 
-畫面上顯示給客戶看的卡片文字，不能出現「Neo4j」「蘇柏翰」「本機知識圖譜」這類內部代號/架構
-細節（之前修過這個問題）。真的要顯示資料來源／連線狀態，只能放在側邊欄的管理者專用區塊。
+畫面上顯示給客戶看的卡片文字，不能出現「Neo4j」「本機知識圖譜」這類內部代號/架構細節，也不能
+出現任何內部人員的稱呼或代號（之前修過這個問題）。真的要顯示資料來源／連線狀態，只能放在側邊欄的
+管理者專用區塊。
 
 ## 已知的其他坑
 
