@@ -1274,13 +1274,23 @@ if uploaded_file is not None:
                 else:
                     st.caption("此 Nessus CSV 未包含 OS 欄位，也找不到 OS Identification 插件輸出，無法統計作業系統。")
 
-            st.markdown("**觸發明細：哪個 IP 觸發了哪個 CVE、在哪個 Port**")
+            st.markdown("**觸發明細：哪個 IP 觸發了哪個 CVE、在哪些 Port**")
+
+            def _port_sort_key(port_proto):
+                port = port_proto.split('/')[0]
+                return int(port) if port.isdigit() else 0
+
+            # 同一個 IP 對同一個 CVE 常常在好幾個 Port 上都被觸發（例如同一個 SSL 弱點在
+            # 443/3389/636 都成立），原本一個 Port 一列會把同一筆漏洞拆得很散，
+            # 改成用 Host+CVE+Risk 分組，把 Port/協定合併成一格逗號分隔、按 Port 號排序
             detail_table = (
-                filtered_df[['Host', 'CVE', 'Port', 'Protocol', 'Risk']]
-                .drop_duplicates()
+                filtered_df
+                .assign(PortProto=lambda d: d['Port'].astype(str) + '/' + d['Protocol'].astype(str))
+                .groupby(['Host', 'CVE', 'Risk'], as_index=False)
+                .agg(Port=('PortProto', lambda s: ', '.join(sorted(set(s), key=_port_sort_key))))
                 .sort_values(['Host', 'Risk'], key=lambda col: col.map(RISK_RANK) if col.name == 'Risk' else col,
                              ascending=[True, False])
-                .rename(columns={'Host': 'IP', 'Protocol': '協定', 'Risk': '風險等級'})
+                .rename(columns={'Host': 'IP', 'Risk': '風險等級', 'Port': '觸發的 Port（Port/協定）'})
             )
             st.dataframe(detail_table, hide_index=True, use_container_width=True)
 
