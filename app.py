@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import html
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
@@ -462,11 +463,13 @@ AI_SUMMARY_SCHEMA = {
         "action": {"type": "string"},
         "reference": {"type": "string"},
         "related": {"type": "string"},
+        "description_zh": {"type": "string"},
+        "solution_zh": {"type": "string"},
     },
-    "required": ["what", "harm", "action", "reference", "related"],
+    "required": ["what", "harm", "action", "reference", "related", "description_zh", "solution_zh"],
 }
 
-AI_SUMMARY_KEYS = ("what", "harm", "action", "reference", "related")
+AI_SUMMARY_KEYS = ("what", "harm", "action", "reference", "related", "description_zh", "solution_zh")
 
 
 def _validate_summary_dict(data):
@@ -489,8 +492,8 @@ def call_groq_model(prompt, model="llama-3.3-70b-versatile"):
                 {
                     "role": "system",
                     "content": (
-                        "你只回傳一個合法的 JSON 物件，且必須包含 what、harm、action、reference、related "
-                        "五個字串欄位，不要有其他文字、不要用 markdown 程式碼區塊包起來。"
+                        "你只回傳一個合法的 JSON 物件，且必須包含 what、harm、action、reference、related、"
+                        "description_zh、solution_zh 七個字串欄位，不要有其他文字、不要用 markdown 程式碼區塊包起來。"
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -560,9 +563,12 @@ CWE 官方說明：{weakness_context['description'][:300]}
     if related_cves:
         related_text = "、".join(related_cves)
 
-    prompt = f"""你是資安分析師，請針對以下弱點掃描結果，寫給非技術主管看的說明。
-不要只是把漏洞描述翻譯成中文，而是要用你自己的理解重新解釋，並必須實際引用下方「官方 CVE 資料庫補充資訊」的具體數據
-（例如 CVSS 分數、EPSS 機率、是否列入 CISA KEV），不能只是背景參考卻完全不提到。請填寫五個欄位：
+    prompt = f"""你是資安分析師，請針對以下弱點掃描結果，寫給非技術主管看的說明，並額外提供官方原文的中文翻譯。
+請填寫七個欄位，分成兩組，兩組的寫法要求完全不同：
+
+【第一組：what/harm/action/reference/related，這五個欄位要用你自己的理解重新解釋，不是翻譯】
+必須實際引用下方「官方 CVE 資料庫補充資訊」的具體數據（例如 CVSS 分數、EPSS 機率、是否列入 CISA KEV），
+不能只是背景參考卻完全不提到。
 
 - what：用非技術人員能懂的比喻或白話，解釋這個弱點的成因（例如是什麼設定錯誤、過時軟體、還是驗證漏洞）。1-2 句話。
 - harm：如果被入侵者利用，實際上可能發生什麼後果（例如：資料外洩、被植入勒索軟體、被當跳板攻擊其他系統、服務中斷等），
@@ -575,6 +581,12 @@ CWE 官方說明：{weakness_context['description'][:300]}
 - related：說明這個弱點分類常見的攻擊手法（引用下方 CAPEC/ATT&CK 資料），以及如果這次掃描裡還有其他漏洞屬於同一個
   CWE 分類，要指出這代表環境中存在系統性、重複出現的弱點模式，不是單一個案，修補時應該一併檢討根本原因
   （例如是不是共用同一套過時框架、同一種開發習慣）。如果都沒有相關資料，就寫「未查得相關攻擊手法或同類漏洞資料」。1-2 句話。
+【第二組：description_zh/solution_zh，這兩個欄位「只能」是逐字直譯，禁止用你自己的理解改寫、禁止摘要、
+禁止省略，輸出**必須全部是繁體中文**（專有名詞如協定名稱、產品名稱、CVE/CWE 編號可保留英文原文，
+其餘一個英文單字都不能留），這兩個欄位絕對不能直接複製貼上英文原文】
+
+- description_zh：把下方「Nessus 漏洞描述」翻譯成繁體中文，一字不漏地逐句直譯，不是摘要也不是重新詮釋。
+- solution_zh：把下方「官方修補方案」翻譯成繁體中文，一字不漏地逐句直譯。如果官方修補方案是「無」，這裡也填「無」。
 
 CVE: {cve}
 名稱: {cve_info['Name']}
@@ -783,11 +795,14 @@ def render_host_treemap(filtered_df):
         span = span_for(row["count"])
         bg, fg = RISK_TREEMAP_COLORS.get(row["max_risk"], RISK_TREEMAP_COLORS["Low"])
         font_size = 12 + span
+        # Host 是 CSV 使用者上傳的內容，不是我們自己產生的資料，組進 HTML 前一定要 escape，
+        # 不然惡意構造的 CSV（例如 Host 欄位塞 <img onerror=...>）會在 components.html 的 iframe 裡被當成標籤執行
+        safe_host = html.escape(str(row["Host"]))
         boxes.append(f"""
         <div style="grid-column: span {span}; grid-row: span {span}; background: {bg};
                     border-radius: 6px; padding: 10px; display: flex; flex-direction: column;
                     justify-content: space-between; min-height: 32px;">
-          <span style="color: {fg}; font-size: 12px; font-weight: 500;">{row['Host']}</span>
+          <span style="color: {fg}; font-size: 12px; font-weight: 500;">{safe_host}</span>
           <div><span style="color: {fg}; font-size: {font_size}px; font-weight: 500;">{row['count']}</span>
           <span style="color: {fg}; font-size: 11px;"> 筆漏洞</span></div>
         </div>""")
@@ -972,6 +987,7 @@ if uploaded_file is not None:
                                 st.session_state[summary_key] = {
                                     "what": "（本筆暫時無法產生 AI 摘要，請稍後重試或改用個別按鈕重新產生）",
                                     "harm": "", "action": "", "reference": "", "related": "",
+                                    "description_zh": "", "solution_zh": "",
                                 }
                             time.sleep(1)
                         progress.progress((i + 1) / total, text=f"{i+1}/{total}：{cve}")
@@ -1038,6 +1054,11 @@ if uploaded_file is not None:
                                 st.error(f"💣 已有現成攻擊模組可直接利用：{', '.join(exploit_frameworks)}")
 
                             st.info(cve_info['Description'])
+                            existing_summary = st.session_state.get(f"ai_summary_{cve}")
+                            if existing_summary and existing_summary.get('description_zh'):
+                                st.caption(f"🌐 繁體中文翻譯：{existing_summary['description_zh']}")
+                            elif not existing_summary:
+                                st.caption("🌐 點下方「AI 摘要與官方資源」可同時取得繁體中文翻譯")
 
                             with st.container(border=True):
                                 st.markdown("🔗 **這次掃描中的相關漏洞**")
@@ -1157,6 +1178,11 @@ if uploaded_file is not None:
 
                         with t2:
                             st.success(cve_info['Solution'] if pd.notna(cve_info['Solution']) else "無明確修補方案，請參考官方規範。")
+                            existing_summary_t2 = st.session_state.get(f"ai_summary_{cve}")
+                            if existing_summary_t2 and existing_summary_t2.get('solution_zh'):
+                                st.caption(f"🌐 繁體中文翻譯：{existing_summary_t2['solution_zh']}")
+                            elif not existing_summary_t2:
+                                st.caption("🌐 點「📌 問題概述」分頁的「AI 摘要與官方資源」可同時取得繁體中文翻譯")
 
                         with t3:
                             st.markdown(f"* **對應 CWE 分類**：`{cve_info['CWE_Parsed']}`")
