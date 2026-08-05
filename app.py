@@ -1277,21 +1277,27 @@ if uploaded_file is not None:
 
             st.markdown("**觸發明細：哪個 IP 觸發了哪個 CVE、在哪些 Port**")
 
-            def _port_sort_key(port_proto):
-                port = port_proto.split('/')[0]
-                return int(port) if port.isdigit() else 0
+            def _format_ports_by_protocol(group):
+                # 依協定分組顯示（例如 "TCP: 22, 443"），而不是每個 Port 後面都重複寫一次協定名稱，
+                # 一個 CVE 若同時有多種協定（少見但可能發生），用全形空格分隔各協定區塊
+                parts = []
+                for proto, sub in group.groupby('Protocol'):
+                    ports = sorted(
+                        set(sub['Port'].astype(str)),
+                        key=lambda p: int(p) if p.isdigit() else 0,
+                    )
+                    parts.append(f"{str(proto).upper()}: {', '.join(ports)}")
+                return '　'.join(parts)
 
             # 同一個 IP 對同一個 CVE 常常在好幾個 Port 上都被觸發（例如同一個 SSL 弱點在
             # 443/3389/636 都成立），原本一個 Port 一列會把同一筆漏洞拆得很散，
-            # 改成用 Host+CVE+Risk 分組，把 Port/協定合併成一格逗號分隔、按 Port 號排序
-            detail_table = (
-                filtered_df
-                .assign(PortProto=lambda d: d['Port'].astype(str) + '/' + d['Protocol'].astype(str))
-                .groupby(['Host', 'CVE', 'Risk'], as_index=False)
-                .agg(Port=('PortProto', lambda s: ', '.join(sorted(set(s), key=_port_sort_key))))
-                .sort_values(['Host', 'Risk'], key=lambda col: col.map(RISK_RANK) if col.name == 'Risk' else col,
-                             ascending=[True, False])
-                .rename(columns={'Host': 'IP', 'Risk': '風險等級', 'Port': '觸發的 Port（Port/協定）'})
+            # 改成用 Host+CVE+Risk 分組，把同一組的 Port 依協定合併成一格
+            detail_table = pd.DataFrame([
+                {'IP': host, 'CVE': cve, '風險等級': risk, '觸發的 Port': _format_ports_by_protocol(group)}
+                for (host, cve, risk), group in filtered_df.groupby(['Host', 'CVE', 'Risk'])
+            ]).sort_values(
+                ['IP', '風險等級'], key=lambda col: col.map(RISK_RANK) if col.name == '風險等級' else col,
+                ascending=[True, False],
             )
             st.dataframe(detail_table, hide_index=True, use_container_width=True)
 
